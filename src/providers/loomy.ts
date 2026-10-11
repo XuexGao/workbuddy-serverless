@@ -680,9 +680,41 @@ function readInputModalities(entry: Record<string, unknown>): string[] {
  */
 export function parseLoomyModels(payload: unknown): ProviderModel[] {
   const envelope = parseLoomyEnvelope<unknown>(payload)
+  // ## 🔴 必须认**三种**形态，不是两种（实测缺陷）
+  //
+  // 1. **业务信封**：`{code:'000000', data:[...]}` —— `envelope.ok` 为真；
+  // 2. **裸数组**：`[...]`；
+  // 3. **裸对象 + `data[]`**（⚠️ 实测 `/models` 的真实形态，此前**漏了**）。
+  //
+  // 第 3 种的实测原文顶层键是：
+  // ```
+  // { reasoning_enabled, reasoning_catalog_version, object, data: [ …13 条… ] }
+  // ```
+  // ⚠️ **它根本没有 `code` 字段** —— 是 OpenAI 风格的列表信封
+  //（`object: "list"` + `data[]`），**不是** Loomy 的业务信封。
+  //
+  // 而 `parseLoomyEnvelope` 要求 `code === LOOMY_OK_CODE`（`'000000'`），
+  // 拿不到 `code` 就判 `ok: false`（那对**业务端点**是对的，见它的注释）；
+  // 于是这里落到 `Array.isArray(payload)` 分支 ——
+  // 而 `payload` 是**对象**，不是数组 ⇒ **恒得空列表** ⇒
+  // `listModels` 报「目录为空：上游响应形状可能已变化」。
+  //
+  // ⚠️ 症状极具误导性：错误文案让人以为**上游改了接口**，
+  // 于是去查上游；而真实原因是**我们自己少认了一种形态** ——
+  // 数据一直好好地躺在 `data[]` 里（13 个模型）。
+  //
+  // ⚠️ 注意 `listModels` 里的 `isEnvelope` 判据是
+  // `typeof payload.code === 'string'`，与本函数的 `code === '000000'`
+  // **不是同一个判据** —— 两者对这份响应都判「非信封」，但只有前者
+  // 不会因此丢掉数据。**同一个概念两处判据不一致**正是本缺陷的温床。
+  const bareObjectData = (() => {
+    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
+    const data = (payload as Record<string, unknown>)['data']
+    return Array.isArray(data) ? data : undefined
+  })()
   const list = envelope.ok
     ? (Array.isArray(envelope.data) ? envelope.data : [])
-    : (Array.isArray(payload) ? payload : [])
+    : (Array.isArray(payload) ? payload : (bareObjectData ?? []))
 
   const models: ProviderModel[] = []
   for (const item of list) {
@@ -718,18 +750,6 @@ export function parseLoomyModels(payload: unknown): ProviderModel[] {
  */
 async function listModels(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderModel[]> {
   const payload = await loomyBusinessRaw(credential, '/models', { method: 'GET' }, signal)
-
-  // 形态 ①：业务信封 —— 失败必须在这里就抛（带上业务码与原文）
-  const envelope = parseLoomyEnvelope<unknown>(payload)
-  const isEnvelope = typeof payload === 'object' && payload !== null && !Array.isArray(payload)
-    && typeof (payload as Record<string, unknown>).code === 'string'
-  if (isEnvelope && !envelope.ok) {
-    throw new ProviderError({
-      provider: 'loomy',
-      message: `Loomy 模型目录失败：${describeLoomyCode(envelope.code, envelope.message)}`,
-    })
-  }
-
   const models = parseLoomyModels(payload)
   if (models.length === 0) {
     // ⚠️ 空目录必须显式失败，不能返回空数组「冒充成功」——

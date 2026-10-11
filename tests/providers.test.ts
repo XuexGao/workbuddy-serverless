@@ -1241,3 +1241,51 @@ test('🔴 SSE `data:` 前缀必须容忍**无空格**形态（否则扫不到�
   assert.ok(/const frame = parseSseLine\(line\)/.test(block),
     '⚠️ 错误帧扫描必须复用 parseSseLine（同一件事只能有一个实现）')
 })
+
+test('🔴 Loomy 模型目录必须认「裸对象 + data[]」形态（实测上游就是这种）', () => {
+  // ## 实测缺陷（全供应商验收时定位）
+  //
+  // `GET /v1/models` 里 `loomy` 贡献 **0 个模型**，且 errors 里写着
+  // 「Loomy 模型目录为空：上游响应形状可能已变化（期望 data[] 且条目 type === "chat"）」。
+  //
+  // ⚠️ 那句文案**误导了我自己**：它让人以为上游改了接口。
+  // 用只读诊断抓到上游真实原文后发现 —— **数据一直好好地在那里**：
+  // ```
+  // { reasoning_enabled, reasoning_catalog_version, object: "list", data: [ …13 条… ] }
+  // ```
+  // 13 个条目，`type` 正是 `'chat'`，`id` 是 `'DeepSeek-V4.1-Flash'`。
+  //
+  // ⚠️ 关键在于它**没有 `code` 字段** —— 是 OpenAI 风格的列表信封，
+  // **不是** Loomy 的业务信封。于是：
+  // - `listModels` 的 `isEnvelope`（`typeof code === 'string'`）判 false（对）；
+  // - 但 `parseLoomyModels` 内部用 `parseLoomyEnvelope`（要求 `code === '000000'`）
+  //   也判 false ⇒ 落到 `Array.isArray(payload)` ⇒ payload 是**对象** ⇒ 恒空。
+  //
+  // ⇒ 修法是补上「裸对象 + `data[]`」这第三种形态。
+  const src = readFileSync('src/providers/loomy.ts', 'utf8')
+
+  // ① 必须有裸对象 data[] 的分支
+  assert.ok(/const bareObjectData = \(\(\) => \{/.test(src),
+    '⚠️ parseLoomyModels 必须认「裸对象 + data[]」形态')
+  assert.ok(/bareObjectData \?\? \[\]/.test(src),
+    '⚠️ 裸对象形态必须作为兜底之一参与取列表')
+
+  // ② 该分支必须在 Array.isArray 之后（保持既有两种形态的优先级不变）
+  const fn = src.slice(src.indexOf('export function parseLoomyModels'))
+  const arrAt = fn.indexOf('Array.isArray(payload) ? payload')
+  const bareAt = fn.indexOf('bareObjectData ?? []')
+  assert.ok(arrAt > 0 && bareAt > arrAt,
+    '⚠️ 顺序应为：信封 → 裸数组 → 裸对象（既有形态优先级不能变）')
+})
+
+test('⚠️ Loomy 的模型条目判据是 `type === "chat"`（实测上游该字段确实存在）', () => {
+  // 上一条测试的前提：上游条目里**真的有** `type` 字段且值为 `'chat'`。
+  // 这个前提若不成立，上一条断言就只是空转。
+  // 实测 `firstKeys` 含：reasoning_efforts / default_reasoning_effort / id /
+  // name / object / created / owned_by / **type** / protocol / context_length /
+  // max_output_tokens / capabilities / is_default_model。
+  const src = readFileSync('src/providers/loomy.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export function isLoomyChatModel'))
+  assert.ok(/type/.test(fn.slice(0, 600)), '⚠️ isLoomyChatModel 的判据应基于 type 字段')
+  assert.ok(/chat/.test(fn.slice(0, 600)), "⚠️ 应判 `type === 'chat'`")
+})
